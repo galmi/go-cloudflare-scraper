@@ -23,6 +23,21 @@ type Transport struct {
 	cookies  http.CookieJar
 }
 
+func NewClient() (c *http.Client, err error) {
+
+	scraper_transport, err := NewTransport(http.DefaultTransport)
+	if err != nil {
+		return
+	}
+
+	c = &http.Client{
+		Transport: scraper_transport,
+		Jar:       scraper_transport.cookies,
+	}
+
+	return
+}
+
 func NewTransport(upstream http.RoundTripper) (*Transport, error) {
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -36,13 +51,18 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		r.Header.Set("User-Agent", userAgent)
 	}
 
+	if r.Header.Get("Referer") == "" {
+		r.Header.Set("Referer", r.URL.String())
+	}
+
 	resp, err := t.upstream.RoundTrip(r)
 	if err != nil {
 		return nil, err
 	}
 
 	// Check if Cloudflare anti-bot is on
-	if resp.StatusCode == 503 && resp.Header.Get("Server") == "cloudflare-nginx" {
+	server_header := resp.Header.Get("Server")
+	if resp.StatusCode == 503 && (server_header == "cloudflare-nginx" || server_header == "cloudflare") {
 		log.Printf("Solving challenge for %s", resp.Request.URL.Hostname())
 		resp, err := t.solveChallenge(resp)
 
@@ -78,7 +98,7 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 	chkURL, _ := url.Parse("/cdn-cgi/l/chk_jschl")
 	u := resp.Request.URL.ResolveReference(chkURL)
 
-	js, err := t.extractJS(string(b))
+	js, err := t.extractJS(string(b), resp.Request.Host)
 	if err != nil {
 		return nil, err
 	}
@@ -88,7 +108,7 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 		return nil, err
 	}
 
-	params.Set("jschl_answer", strconv.Itoa(int(answer)+len(resp.Request.URL.Host)))
+	params.Set("jschl_answer", fmt.Sprintf("%.10f", answer))
 
 	req, err := http.NewRequest("GET", fmt.Sprintf("%s?%s", u.String(), params.Encode()), nil)
 	if err != nil {
@@ -112,24 +132,25 @@ func (t Transport) solveChallenge(resp *http.Response) (*http.Response, error) {
 	return resp, nil
 }
 
-func (t Transport) evaluateJS(js string) (int64, error) {
+func (t Transport) evaluateJS(js string) (float64, error) {
 	vm := otto.New()
 	result, err := vm.Run(js)
 	if err != nil {
 		return 0, err
 	}
-	return result.ToInteger()
+	return result.ToFloat()
 }
 
 var jsRegexp = regexp.MustCompile(
 	`setTimeout\(function\(\){\s+(var ` +
 		`s,t,o,p,b,r,e,a,k,i,n,g,f.+?\r?\n[\s\S]+?a\.value =.+?)\r?\n`,
 )
-var jsReplace1Regexp = regexp.MustCompile(`a\.value = (parseInt\(.+?\)).+`)
+var jsReplace1Regexp = regexp.MustCompile(`a\.value = (.+ \+ t\.length).+`)
 var jsReplace2Regexp = regexp.MustCompile(`\s{3,}[a-z](?: = |\.).+`)
 var jsReplace3Regexp = regexp.MustCompile(`[\n\\']`)
+var jsReplace4Regexp = regexp.MustCompile(`t\.length`)
 
-func (t Transport) extractJS(body string) (string, error) {
+func (t Transport) extractJS(body string, domain string) (string, error) {
 	matches := jsRegexp.FindStringSubmatch(body)
 	if len(matches) == 0 {
 		return "", errors.New("No matching javascript found")
@@ -138,6 +159,7 @@ func (t Transport) extractJS(body string) (string, error) {
 	js := matches[1]
 	js = jsReplace1Regexp.ReplaceAllString(js, "$1")
 	js = jsReplace2Regexp.ReplaceAllString(js, "")
+	js = jsReplace4Regexp.ReplaceAllString(js, strconv.Itoa(len(domain)))
 
 	// Strip characters that could be used to exit the string context
 	// These characters are not currently used in Cloudflare's arithmetic snippet
